@@ -3,17 +3,28 @@ robot-env/
 __pycache__/
 *.py[cod]
 *$py.class
+.env
 
-# Models and large files
+# Models and large files (excluding .pt to allow small model weights if needed, but better to ignore all)
 *.pt
 *.onnx
 *.onnx.json
+
+# Audio and Image assets
 *.wav
 *.mp3
 *.jpg
 *.jpeg
 *.png
+
+# Project specific ignores
 robot-assistant/voices/
+robot-assistant/data/
+robot-assistant/models/
+runs/
+
+# System-generated logs
+robot-assistant/logs/
 
 # User specifically requested Docs folder to be ignored
 Docs/
