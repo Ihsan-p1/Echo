@@ -1,0 +1,19 @@
+# Environment
+robot-env/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Models and large files
+*.pt
+*.onnx
+*.onnx.json
+*.wav
+*.mp3
+*.jpg
+*.jpeg
+*.png
+robot-assistant/voices/
+
+# User specifically requested Docs folder to be ignored
+Docs/
