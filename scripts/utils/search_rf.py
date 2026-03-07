@@ -14,7 +14,11 @@ try:
     valid_projects = [m for m in matches if m[0] not in excluded and m[1] not in excluded]
     
     print("Found potential projects:")
-    for m in list(set(valid_projects))[:10]:
+    unique_matches = list(set(valid_projects))
+    count = 0
+    for m in unique_matches:
+        if count >= 10: break
         print(f"Workspace: {m[0]}, Project: {m[1]}")
+        count += 1
 except Exception as e:
     print("Error:", e)

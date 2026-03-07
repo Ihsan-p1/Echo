@@ -79,34 +79,31 @@ def test_llm_baseline():
         ("Apa yang kamu lihat?", ["kursi", "meja", "botol"], "ID", None),
     ]
 
-    en_acc = 0
-    id_acc = 0
-    en_latex = 0
-    id_latex = 0
+    stats = {
+        "en": {"acc": 0, "latency": 0.0},
+        "id": {"acc": 0, "latency": 0.0}
+    }
     
     for i, (prompt, context, lang, action) in enumerate(test_prompts):
+        lang_key = lang.lower()
         print(f"\n--- Prompt {i+1} [{lang}] ---")
         print(f"Context: {context} | Query: '{prompt}'")
         
         response, latency = query_ollama(prompt, context)
-        
         command_pass, lang_pass = assess_extraction(response, action, lang)
         
-        if lang == "EN":
-            en_latex += latency
-            if command_pass and lang_pass: en_acc += 1
-        else:
-            id_latex += latency
-            if command_pass and lang_pass: id_acc += 1
+        stats[lang_key]["latency"] += float(latency)
+        if command_pass and lang_pass:
+            stats[lang_key]["acc"] += 1
             
         print(f"Response: {response}")
         print(f"Latency: {latency:.2f}s | Command Extraction: {'PASS' if command_pass else 'FAIL'} | Lang Match: {'PASS' if lang_pass else 'FAIL'}")
 
     print("\n=== LLM EVALUATION SUMMARY ===")
-    print(f"EN Score: {en_acc}/5 | Avg Latency: {en_latex/5:.2f}s")
-    print(f"ID Score: {id_acc}/5 | Avg Latency: {id_latex/5:.2f}s")
+    print(f"EN Score: {stats['en']['acc']}/5 | Avg Latency: {stats['en']['latency']/5:.2f}s")
+    print(f"ID Score: {stats['id']['acc']}/5 | Avg Latency: {stats['id']['latency']/5:.2f}s")
     
-    if (en_acc / 5) < 0.8 or (id_acc / 5) < 0.8:
+    if (stats['en']['acc'] / 5) < 0.8 or (stats['id']['acc'] / 5) < 0.8:
         print("⚠️ FINE-TUNE TRIGGERED: Command extraction < 80% or Language mismatch > 20%")
     else:
         print("✅ LLM baseline passed.")

@@ -18,7 +18,8 @@ os.makedirs(DEST, exist_ok=True)
 
 rf = Roboflow(api_key=API_KEY) if API_KEY else None
 
-if not rf:
+if rf is None:
+    print("Error: Roboflow object not initialized. Check your API key.")
     exit(1)
 
 # Try downloading gadget/electronics datasets from Roboflow Universe
@@ -29,15 +30,16 @@ datasets_to_try = [
     ("iot-fwsxb", "gadget-n6gye", 1),
 ]
 
-for workspace, project_name, version_num in datasets_to_try:
-    try:
-        print(f"\nTrying: {workspace}/{project_name}/v{version_num}")
-        project = rf.workspace(workspace).project(project_name)
-        version = project.version(version_num)
-        dataset = version.download("yolov8", location=DEST)
-        print(f"Downloaded successfully to {DEST}")
-        print(f"Classes: {version.classes}")
-        break
-    except Exception as e:
-        print(f"Failed: {e}")
-        continue
+if rf is not None:
+    for workspace, project_name, version_num in datasets_to_try:
+        try:
+            print(f"\nTrying: {workspace}/{project_name}/v{version_num}")
+            project = rf.workspace(workspace).project(project_name)
+            version = project.version(version_num)
+            dataset = version.download("yolov8", location=DEST)
+            print(f"Downloaded successfully to {DEST}")
+            print(f"Classes: {version.classes}")
+            break
+        except Exception as e:
+            print(f"Failed: {e}")
+            continue
