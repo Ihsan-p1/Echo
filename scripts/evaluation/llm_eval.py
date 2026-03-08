@@ -7,11 +7,11 @@ def query_ollama(prompt, context_objects):
     objects_str = ", ".join(context_objects)
     
     system_prompt = (
-        "Kamu adalah robot asisten yang ramah. "
-        "Kamu dapat melihat melalui kamera.\n"
-        f"Context visual saat ini: [{objects_str}]\n"
-        f"Pertanyaan user: {prompt}\n"
-        "Jawab dalam 1-2 kalimat. Ekstrak motor command jika ada (MAJU, MUNDUR, KIRI, KANAN, STOP)."
+        "You are a friendly robot assistant. "
+        "You can see through the camera.\n"
+        f"Current visual context: [{objects_str}]\n"
+        f"User question: {prompt}\n"
+        "Answer in 1-2 sentences. Extract motor commands if any (FORWARD, BACKWARD, LEFT, RIGHT, STOP)."
     )
     
     # Using ollama CLI for direct, simple interaction without depending on extra libraries
@@ -33,12 +33,11 @@ def query_ollama(prompt, context_objects):
 def assess_extraction(response_text, expected_action, lang):
     """Simple heuristic to check command extraction"""
     response_upper = response_text.upper()
-    is_id_reply = ("SAYA" in response_upper) or ("MELIHAT" in response_upper) or ("ROBOT" in response_upper) or ("TIDAK" in response_upper)
+    is_en_reply = ("I " in response_upper) or ("SEE" in response_upper) or ("ROBOT" in response_upper) or ("NOT" in response_upper)
     
-    has_command = False
     action_match = False
     
-    commands = ["MAJU", "MUNDUR", "KIRI", "KANAN", "STOP"]
+    commands = ["FORWARD", "BACKWARD", "LEFT", "RIGHT", "STOP"]
     found_commands = [cmd for cmd in commands if cmd in response_upper]
     
     if expected_action:
@@ -49,15 +48,7 @@ def assess_extraction(response_text, expected_action, lang):
             action_match = True # Passed because no false positives
             
     # Language match check (Basic heuristic)
-    lang_match = False
-    if lang == "ID" and is_id_reply:
-         lang_match = True
-    elif lang == "EN" and not is_id_reply:
-         lang_match = True
-    elif lang == "ID" and not is_id_reply and ("I " in response_text or "SEE " in response_text):
-        lang_match = False
-    else:
-        lang_match = True # Benefit of doubt
+    lang_match = is_en_reply if lang == "EN" else True
         
     return action_match, lang_match
 
@@ -65,18 +56,15 @@ def test_llm_baseline():
     print("=== TEST 2.3: LLM Baseline Evaluation (Bilingual) ===")
     
     test_prompts = [
-        # --- English ---
         ("What do you see on the table?", ["laptop", "bottle", "book"], "EN", None),
-        ("Come to me, robot.", ["person"], "EN", "MAJU"),
+        ("Come to me, robot.", ["person"], "EN", "FORWARD"),
         ("Is it safe to move forward?", [], "EN", None),
         ("Who is in the room?", ["person"], "EN", None),
         ("What objects are in front of you?", ["chair", "table", "bottle"], "EN", None),
-        # --- Indonesian ---
-        ("Ada apa di mejaku?", ["laptop", "gelas", "buku"], "ID", None),
-        ("Robot, datang ke saya.", ["person"], "ID", "MAJU"),
-        ("Apakah aman untuk maju?", [], "ID", None),
-        ("Siapa yang ada di ruangan ini?", ["person"], "ID", None),
-        ("Apa yang kamu lihat?", ["kursi", "meja", "botol"], "ID", None),
+        ("Move back a bit.", [], "EN", "BACKWARD"),
+        ("Turn left please.", [], "EN", "LEFT"),
+        ("Look to the right.", [], "EN", "RIGHT"),
+        ("Stop immediately!", [], "EN", "STOP"),
     ]
 
     stats = {
@@ -99,9 +87,14 @@ def test_llm_baseline():
         print(f"Response: {response}")
         print(f"Latency: {latency:.2f}s | Command Extraction: {'PASS' if command_pass else 'FAIL'} | Lang Match: {'PASS' if lang_pass else 'FAIL'}")
 
+    num_en = sum(1 for p in test_prompts if p[2] == "EN")
+    num_id = sum(1 for p in test_prompts if p[2] == "ID")
+
     print("\n=== LLM EVALUATION SUMMARY ===")
-    print(f"EN Score: {stats['en']['acc']}/5 | Avg Latency: {stats['en']['latency']/5:.2f}s")
-    print(f"ID Score: {stats['id']['acc']}/5 | Avg Latency: {stats['id']['latency']/5:.2f}s")
+    if num_en > 0:
+        print(f"EN Score: {stats['en']['acc']}/{num_en} | Avg Latency: {stats['en']['latency']/num_en:.2f}s")
+    if num_id > 0:
+        print(f"ID Score: {stats['id']['acc']}/{num_id} | Avg Latency: {stats['id']['latency']/num_id:.2f}s")
     
     if (stats['en']['acc'] / 5) < 0.8 or (stats['id']['acc'] / 5) < 0.8:
         print("⚠️ FINE-TUNE TRIGGERED: Command extraction < 80% or Language mismatch > 20%")
