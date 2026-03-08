@@ -3,17 +3,17 @@ import time
 from ultralytics import YOLO
 
 def test_finetuned_webcam():
-    print("Memuat model YOLO11n fine-tuned (Campus)...")
+    print("Loading fine-tuned YOLO11n (Campus) model...")
     model = YOLO("robot-assistant/models/yolo11n-campus.pt")
     
-    print("Membuka kamera laptop (Webcam)...")
+    print("Opening laptop webcam...")
     cap = cv2.VideoCapture(0)
     
     if not cap.isOpened():
-        print("Error: Tidak dapat membuka webcam.")
+        print("Error: Could not open webcam.")
         return
 
-    print("Kamera berhasil dibuka. Tekan 'q' untuk keluar.")
+    print("Webcam successfully opened. Press 'q' to exit.")
     
     prev_time = 0
 
@@ -30,7 +30,7 @@ def test_finetuned_webcam():
         
         annotated_frame = results[0].plot()
         
-        cv2.putText(annotated_frame, f"FPS: {fps:.1f} | LAB & CAMPUS", (10, 30), 
+        cv2.putText(annotated_frame, f"FPS: {fps:.1f} | Yolo Detector", (10, 30), 
                      cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
         
         cv2.imshow("YOLO LAB & CAMPUS DETECTOR", annotated_frame)

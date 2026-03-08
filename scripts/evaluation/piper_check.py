@@ -16,7 +16,7 @@ def check_piper():
             f.setnchannels(1)
             f.setsampwidth(2)
             f.setframerate(voice.config.sample_rate)
-            voice.synthesize("Halo, saya robot asisten yang siap membantu.", f)
+            voice.synthesize("Hello, I am your robot assistant ready to help.", f)
         print("Success! TTS file generated.")
     except Exception as e:
         print(f"Error loading or synthesizing Piper TTS: {e}")
