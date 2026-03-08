@@ -43,7 +43,7 @@ def finetune_whisper():
     dataset = dataset.train_test_split(test_size=0.1)
     
     print("\nLoading Whisper Processor & Tokenizer...")
-    model_id = "openai/whisper-medium"
+    model_id = "openai/whisper-small"
     feature_extractor = WhisperFeatureExtractor.from_pretrained(model_id)
     tokenizer = WhisperTokenizer.from_pretrained(model_id, language="English", task="transcribe")
     processor = WhisperProcessor.from_pretrained(model_id, language="English", task="transcribe")
@@ -88,10 +88,10 @@ def finetune_whisper():
     
     training_args = Seq2SeqTrainingArguments(
         output_dir="robot-assistant/models/whisper-finetuned",
-        per_device_train_batch_size=4,
-        gradient_accumulation_steps=2,
+        per_device_train_batch_size=8,
+        gradient_accumulation_steps=1,
         learning_rate=1e-3,
-        num_train_epochs=10,                      # 10 epochs for this small dataset
+        num_train_epochs=5,                       # 5 epochs for speed and efficiency
         fp16=True,                                # Use mixed precision on Ampere/RTX GPUs
         eval_strategy="steps",                   # Replaced evaluation_strategy with eval_strategy
         predict_with_generate=True,

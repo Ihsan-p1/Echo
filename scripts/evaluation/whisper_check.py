@@ -12,7 +12,7 @@ def check_whisper():
     
     print("\nTranscribing 'test_audio.wav'...")
     start_time = time.time()
-    segments, info = model.transcribe("test_audio.wav", language="id")
+    segments, info = model.transcribe("test_audio.wav", language="en")
     
     # Print results
     print(f"Detected language: '{info.language}' with probability {info.language_probability}")
