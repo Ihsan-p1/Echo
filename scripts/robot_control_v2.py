@@ -4,6 +4,8 @@ import numpy as np
 import threading
 import queue
 import time
+import wave
+import io
 from ultralytics import YOLO
 from transformers import (
     AutoModelForCausalLM,
@@ -14,6 +16,7 @@ from transformers import (
 )
 from peft import PeftModel
 import sounddevice as sd
+from piper.voice import PiperVoice
 from colorama import Fore, Back, Style, init
 
 # Initialize colorama
@@ -25,6 +28,8 @@ VISION_MODEL_PATH = "robot-assistant/models/yolo11n.pt" # Use base model for bro
 WHISPER_MODEL_PATH = "robot-assistant/models/whisper-finetuned-best"
 LLM_BASE_MODEL = "unsloth/Llama-3.2-3B-Instruct-bnb-4bit"
 LLM_ADAPTER_PATH = "robot-assistant/models/llm-finetuned-adapter"
+JARVIS_VOICE_MODEL = "robot-assistant/voices/jarvis/en/en_GB/jarvis/high/jarvis-high.onnx"
+JARVIS_VOICE_CONFIG = "robot-assistant/voices/jarvis/en/en_GB/jarvis/high/jarvis-high.onnx.json"
 
 class EchoRobot:
     def __init__(self):
@@ -148,7 +153,48 @@ class EchoRobot:
             return response
         except Exception as e:
             print(f"\n[BRAIN ERROR] LLM Inference failed: {e}")
-            return "<response>Sorry, my brain encountered an error.</response>\n<command>STOP</command>"
+            return "N/A"
+
+    def _clean_speech_text(self, text):
+        """Remove any command/metadata artifacts from text before speaking."""
+        import re
+        # Remove XML tags like <response>, </response>, <command>, </command>
+        text = re.sub(r'</?\w+>', '', text)
+        # Remove lines with ### or command metadata
+        lines = text.split('\n')
+        clean_lines = [l.strip() for l in lines if not l.strip().startswith('###') and 'Motor Command' not in l and 'FORWARD' not in l.upper().split() and 'BACKWARD' not in l.upper().split()]
+        text = ' '.join(clean_lines).strip()
+        # Remove extra whitespace
+        text = re.sub(r'\s+', ' ', text)
+        return text
+
+    def speak_async(self, text):
+        clean_text = self._clean_speech_text(text)
+        if not clean_text:
+            return
+            
+        def _speak():
+            try:
+                print(f"{Fore.BLUE}{Style.BRIGHT}[\U0001f50a SPEAKING]{Style.RESET_ALL} {clean_text}")
+                voice = PiperVoice.load(
+                    JARVIS_VOICE_MODEL,
+                    config_path=JARVIS_VOICE_CONFIG
+                )
+                # Collect raw audio from synthesize() iterator
+                audio_bytes = b''
+                for audio_chunk in voice.synthesize(clean_text):
+                    audio_bytes += audio_chunk.audio_int16_bytes
+                
+                if audio_bytes:
+                    audio_data = np.frombuffer(audio_bytes, dtype=np.int16)
+                    sd.play(audio_data, samplerate=voice.config.sample_rate)
+                    sd.wait()
+            except Exception as e:
+                print(f"[TTS ERROR] Speech failed: {e}")
+
+        threading.Thread(target=_speak, daemon=True).start()
+
+
 
     def run(self):
         cap = cv2.VideoCapture(0)
@@ -196,6 +242,10 @@ class EchoRobot:
                     print(f"{Fore.WHITE}{resp_text}")
                     print(f"{Fore.MAGENTA}{Style.BRIGHT}EXECUTING COMMAND:{Style.RESET_ALL} {Fore.RED}{cmd_text}")
                     print(f"{Fore.YELLOW}{'='*50}\n")
+                    
+                    # Speak the response asynchronously
+                    if resp_text and resp_text != "N/A":
+                        self.speak_async(resp_text)
                     
                     # Log to file for tracking
                     with open("robot_history.log", "a") as f:
