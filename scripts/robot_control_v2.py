@@ -17,7 +17,6 @@ from ultralytics import YOLO
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
-    BitsAndBytesConfig,
     AutoModelForSpeechSeq2Seq, # Add these for Whisper
     AutoProcessor
 )
@@ -50,13 +49,33 @@ HAND_CONNECTIONS = [
     (5,9),(9,13),(13,17),          # palm
 ]
 
+# Gesture-to-command mapping (deterministic, bypass LLM)
+GESTURE_COMMAND_MAP = {
+    "pointing":    "FORWARD",
+    "open_palm":   "STOP",
+    "fist":        "BACKWARD",
+    "thumb_left":  "LEFT",
+    "thumb_right": "RIGHT",
+}
+
+GESTURE_RESPONSE_MAP = {
+    "pointing":    "Moving forward.",
+    "open_palm":   "Stopping.",
+    "fist":        "Moving backward.",
+    "thumb_left":  "Turning left.",
+    "thumb_right": "Turning right.",
+}
+
 class GestureDetector:
     """Background gesture detector using MediaPipe HandLandmarker (tasks API)."""
     GESTURE_MAP = {
-        "open_palm": "STOP",
-        "pointing": "FORWARD",
-        "thumbs_up": "NONE",
-        "none": "NONE"
+        "open_palm":   "STOP",
+        "pointing":    "FORWARD",
+        "fist":        "BACKWARD",
+        "thumb_left":  "LEFT",
+        "thumb_right": "RIGHT",
+        "thumbs_up":   "NONE",
+        "none":        "NONE",
     }
 
     def __init__(self):
@@ -81,27 +100,40 @@ class GestureDetector:
         tip_ids = [4, 8, 12, 16, 20]
         pip_ids = [3, 6, 10, 14, 18]
 
-        fingers_up = []
+        # Thumb: distance-based (more stable than x comparison)
+        wrist = landmarks[0]
+        thumb_tip = landmarks[4]
+        thumb_pip = landmarks[3]
+        thumb_dist_tip = abs(thumb_tip.x - wrist.x)
+        thumb_dist_pip = abs(thumb_pip.x - wrist.x)
+        thumb_up = thumb_dist_tip > thumb_dist_pip
 
-        # Thumb: compare x
-        if landmarks[tip_ids[0]].x < landmarks[pip_ids[0]].x:
-            fingers_up.append(True)
-        else:
-            fingers_up.append(False)
+        # Other fingers: tip.y < pip.y = extended
+        index_up  = landmarks[tip_ids[1]].y < landmarks[pip_ids[1]].y
+        middle_up = landmarks[tip_ids[2]].y < landmarks[pip_ids[2]].y
+        ring_up   = landmarks[tip_ids[3]].y < landmarks[pip_ids[3]].y
+        pinky_up  = landmarks[tip_ids[4]].y < landmarks[pip_ids[4]].y
 
-        # Other fingers: compare y (tip above pip = extended)
-        for i in range(1, 5):
-            if landmarks[tip_ids[i]].y < landmarks[pip_ids[i]].y:
-                fingers_up.append(True)
-            else:
-                fingers_up.append(False)
-
-        if all(fingers_up):
+        # Open palm: all 4 fingers up → STOP
+        if index_up and middle_up and ring_up and pinky_up:
             return "open_palm"
-        elif fingers_up[1] and not any(fingers_up[2:]):
+
+        # Pointing: only index finger up → FORWARD
+        if index_up and not middle_up and not ring_up and not pinky_up:
             return "pointing"
-        elif fingers_up[0] and not any(fingers_up[1:]):
+
+        # Fist: all fingers closed, thumb not extended → BACKWARD
+        if not index_up and not middle_up and not ring_up and not pinky_up and not thumb_up:
+            return "fist"
+
+        # Thumb only extended → check direction for LEFT/RIGHT/thumbs_up
+        if thumb_up and not index_up and not middle_up and not ring_up and not pinky_up:
+            if thumb_tip.x < wrist.x - 0.12:
+                return "thumb_left"
+            elif thumb_tip.x > wrist.x + 0.12:
+                return "thumb_right"
             return "thumbs_up"
+
         return "none"
 
     def _draw_landmarks(self, frame, landmarks, h, w):
@@ -139,6 +171,13 @@ class GestureDetector:
     def get_command(self):
         """Map current gesture to motor command."""
         return self.GESTURE_MAP.get(self.get_gesture(), "NONE")
+
+    def close(self):
+        """Explicitly close MediaPipe landmarker to prevent TypeError on exit."""
+        try:
+            self.landmarker.close()
+        except Exception:
+            pass
 
 
 class WakeWordListener:
@@ -207,7 +246,7 @@ class EchoRobot:
         print("Loading Audio Module (Whisper)...")
         self.stt_model = AutoModelForSpeechSeq2Seq.from_pretrained(
             WHISPER_MODEL_PATH,
-            torch_dtype=torch.float16, # Use half for speed
+            dtype=torch.float16, # Use half for speed
             low_cpu_mem_usage=True,
             use_safetensors=True
         ).to(self.device)
@@ -215,16 +254,10 @@ class EchoRobot:
         
         # 3. Load Brain (Llama 3.2 3B + LoRA)
         print("Loading Brain Module (Llama 3.2 3B LoRA)...")
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_use_double_quant=True,
-        )
         base_model = AutoModelForCausalLM.from_pretrained(
             LLM_BASE_MODEL,
-            quantization_config=bnb_config,
             device_map="auto"
+            # quantization_config not needed — unsloth model bundles its own config
         )
         self.llm_model = PeftModel.from_pretrained(base_model, LLM_ADAPTER_PATH)
         self.llm_tokenizer = AutoTokenizer.from_pretrained(LLM_BASE_MODEL)
@@ -401,23 +434,24 @@ class EchoRobot:
         try:
             print("[BRAIN] Analyzing visual context and query...")
             
-            instruction = """You are Echo, a friendly robot assistant with camera and motor control.
-Analyze the visual context and user input, then respond with structured XML:
+            instruction = """You are Echo, a friendly robot assistant with a camera.
+Always respond using this exact XML format:
 
-<intent>QUERY|COMMAND|GESTURE_COMMAND</intent>
-<response>Your natural language response here</response>
+<response>Your spoken response here. Natural, 1-2 sentences max.</response>
 <command>FORWARD|BACKWARD|LEFT|RIGHT|STOP|NONE</command>
 
-Intent types:
-- QUERY: user asks about what robot sees or general questions
-- COMMAND: user gives movement instruction via speech
-- GESTURE_COMMAND: movement from detected hand gesture
-
 Rules:
-- Always respond in English
-- Keep responses to 1-2 sentences
-- If gesture is detected AND voice is empty, use gesture as the command source
-- If both gesture and voice are present, voice takes priority"""
+- <response> is what you SAY OUT LOUD. Keep it conversational.
+- <command> is the motor action. Use NONE if no movement needed.
+- NEVER put command keywords inside <response>.
+- NEVER output any text outside the XML tags.
+- Always respond in English.
+
+Example:
+Visual: person (center, close), laptop (left, nearby)
+User: What do you see?
+<response>I can see a person right in front of me and a laptop to my left.</response>
+<command>NONE</command>"""
             input_text = f"Visual Context: {visual_context}\nUser Input: {user_input}"
             prompt = f"### Instruction: {instruction}\n### Input: {input_text}\n### Response: "
             
@@ -427,7 +461,9 @@ Rules:
                 outputs = self.llm_model.generate(
                     **inputs,
                     max_new_tokens=150,
-                    do_sample=False,
+                    do_sample=True,
+                    temperature=0.3,
+                    top_p=0.9,
                     pad_token_id=self.llm_tokenizer.eos_token_id,
                     eos_token_id=self.llm_tokenizer.eos_token_id
                 )
@@ -473,22 +509,23 @@ Rules:
         return intent, response, command
 
     def _clean_speech_text(self, text):
-        """Remove command/metadata artifacts from text before speaking (c3: less aggressive)."""
-        text = re.sub(r'<[^>]+>', '', text)  # strip XML tags
+        """Extract clean speech text from LLM output, stripping XML and command artifacts."""
+        # Priority: extract content from <response> tag if present
+        match = re.search(r'<response>(.*?)</response>', text, re.DOTALL)
+        if match:
+            return match.group(1).strip()
+        # Fallback: strip command tags and their content
+        text = re.sub(r'<command>.*?</command>', '', text, flags=re.DOTALL)
+        # Strip remaining XML tags
+        text = re.sub(r'<[^>]+>', '', text)
+        # Remove lines that are solely a command keyword
         lines = text.split('\n')
-        clean = []
-        for line in lines:
-            s = line.strip()
-            if not s:
-                continue
-            if s.startswith('###'):
-                continue
-            if re.match(r'^(Motor Command|Command)\s*:', s, re.I):
-                continue
-            # c3: Only remove lines that are SOLELY a command keyword
-            if re.match(r'^(FORWARD|BACKWARD|LEFT|RIGHT|STOP|NONE)$', s, re.I):
-                continue
-            clean.append(s)
+        clean = [l.strip() for l in lines
+                 if l.strip()
+                 and not re.match(
+                     r'^(FORWARD|BACKWARD|LEFT|RIGHT|STOP|NONE)$',
+                     l.strip(), re.I
+                 )]
         return re.sub(r'\s+', ' ', ' '.join(clean)).strip()
 
     def speak_async(self, text):
@@ -513,7 +550,28 @@ Rules:
 
         threading.Thread(target=_speak, daemon=True).start()
 
+    def handle_gesture_command(self, gesture):
+        """Gesture command — bypass LLM completely. Deterministic, <1ms."""
+        command = GESTURE_COMMAND_MAP.get(gesture)
+        response = GESTURE_RESPONSE_MAP.get(gesture, "Gesture not recognized.")
 
+        if command:
+            self.send_motor_command(command)
+            self.speak_async(response)
+            print(f"\n{Fore.YELLOW}{'='*50}")
+            print(f"{Fore.YELLOW}{Style.BRIGHT}[GESTURE]{Style.RESET_ALL} {gesture} \u2192 {Fore.RED}{command}")
+            print(f"{Fore.YELLOW}{'='*50}\n")
+            # Log gesture command
+            self.logger.info(
+                f"Intent: GESTURE_COMMAND | Source: gesture | Context: {self.visual_context} | "
+                f"Input: gesture:{gesture} | Response: {response} | Command: {command}")
+        else:
+            print(f"{Fore.YELLOW}[GESTURE]{Style.RESET_ALL} '{gesture}' \u2014 no mapping found.")
+
+    def send_motor_command(self, command):
+        """Placeholder for laptop testing. Replace body when integrating ESP32."""
+        # TODO: self.serial.write(f"MOTOR:{command}\n".encode()) when ESP32 connected
+        print(f"{Fore.MAGENTA}[MOTOR]{Style.RESET_ALL} >> {command} (simulated \u2014 ESP32 not connected)")
 
     def _process_brain_response(self, user_input, source="voice"):
         """Unified brain processing pipeline: LLM → parse → display → speak → log."""
@@ -681,18 +739,17 @@ Rules:
                 # Manual voice trigger (fallback)
                 self.audio_trigger.put("manual")
             elif key == ord('g'):
-                # Gesture trigger
+                # Gesture trigger — bypass LLM, deterministic mapping
                 current_gesture = self.gesture_detector.get_gesture()
                 if current_gesture != "none" and self.robot_state == "IDLE":
-                    print(f"\n{Fore.YELLOW}{Style.BRIGHT}USER (gesture):{Style.RESET_ALL} {current_gesture}")
-                    user_input = f"gesture: {current_gesture}"
-                    self._process_brain_response(user_input, source="gesture")
-                elif current_gesture == "none":
+                    self.handle_gesture_command(current_gesture)
+                else:
                     print(f"{Fore.YELLOW}[GESTURE]{Style.RESET_ALL} No gesture detected.")
 
         # Cleanup
         self.wakeword.stop()
         self.audio_trigger.put(None)  # shutdown worker
+        self.gesture_detector.close()  # explicit close — prevent TypeError on exit
         cap.release()
         cv2.destroyAllWindows()
 
