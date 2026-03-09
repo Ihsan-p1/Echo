@@ -7,6 +7,8 @@ import time
 import wave
 import io
 import re
+import logging
+from logging.handlers import RotatingFileHandler
 import webrtcvad
 import mediapipe as mp
 import pyaudio
@@ -29,14 +31,14 @@ init(autoreset=True)
 # import scipy.io.wavfile as wav # Removed as no longer needed
 
 # --- CONFIGURATION ---
-VISION_MODEL_PATH = "robot-assistant/models/yolo11n.pt" # Use base model for broad vision
+VISION_MODEL_PATH = "robot-assistant/models/yolo11n.pt"
 WHISPER_MODEL_PATH = "robot-assistant/models/whisper-finetuned-best"
 LLM_BASE_MODEL = "unsloth/Llama-3.2-3B-Instruct-bnb-4bit"
 LLM_ADAPTER_PATH = "robot-assistant/models/llm-finetuned-adapter"
 JARVIS_VOICE_MODEL = "robot-assistant/voices/jarvis/en/en_GB/jarvis/high/jarvis-high.onnx"
 JARVIS_VOICE_CONFIG = "robot-assistant/voices/jarvis/en/en_GB/jarvis/high/jarvis-high.onnx.json"
-
 HAND_LANDMARKER_PATH = "robot-assistant/models/hand_landmarker.task"
+YOLO_CONF_THRESHOLD = 0.45  # c4: raised from 0.15 to reduce false positives
 
 # MediaPipe Hand Connections for drawing (since mp.solutions.drawing_utils is removed)
 HAND_CONNECTIONS = [
@@ -236,10 +238,32 @@ class EchoRobot:
         print("Loading Wake Word Module (openwakeword)...")
         self.wakeword = WakeWordListener(sensitivity=0.5)
         
-        # 6. Threading infrastructure
+        # 6. Load TTS Voice once (c1: avoid reloading .onnx every speak call)
+        print("Loading TTS Voice (Piper)...")
+        self.tts_voice = PiperVoice.load(JARVIS_VOICE_MODEL, config_path=JARVIS_VOICE_CONFIG)
+        
+        # 7. Threading infrastructure
         self.audio_trigger = queue.Queue()    # signals to start audio pipeline
         self.response_queue = queue.Queue()   # results from audio pipeline
         self.robot_state = "IDLE"             # IDLE, LISTENING, THINKING, SPEAKING
+        
+        # 8. Setup rotating logger (c6: 5MB max, 3 backups)
+        log_handler = RotatingFileHandler(
+            'robot_history.log', maxBytes=5*1024*1024, backupCount=3)
+        logging.basicConfig(
+            handlers=[log_handler], level=logging.INFO,
+            format='%(asctime)s | %(message)s')
+        self.logger = logging.getLogger('echo')
+        
+        # c2: VRAM monitoring after all models loaded
+        if torch.cuda.is_available():
+            alloc = torch.cuda.memory_allocated() / 1024**3
+            total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+            pct = alloc / total * 100
+            color = Fore.RED if pct > 90 else Fore.YELLOW if pct > 75 else Fore.GREEN
+            print(f"{color}[VRAM] {alloc:.2f}GB / {total:.2f}GB ({pct:.0f}% used){Style.RESET_ALL}")
+            if pct > 90:
+                print(f"{Fore.RED}{Style.BRIGHT}[VRAM WARNING] >90% used — high OOM risk!{Style.RESET_ALL}")
         
         print(f"{Fore.GREEN}{Style.BRIGHT}Robot Systems Online!{Style.RESET_ALL}")
         print(f"  Say {Fore.CYAN}'Hey Jarvis'{Style.RESET_ALL} or press {Fore.CYAN}'s'{Style.RESET_ALL} to speak")
@@ -248,7 +272,7 @@ class EchoRobot:
     def get_visual_context(self, frame):
         """Extract spatial-aware visual context with position, distance proxy, and confidence."""
         h, w = frame.shape[:2]
-        results = self.vision_model(frame, conf=0.15, verbose=False)
+        results = self.vision_model(frame, conf=YOLO_CONF_THRESHOLD, verbose=False)
         context_items = []
 
         for r in results:
@@ -417,9 +441,17 @@ Rules:
                 response = full_response.strip()
                 
             return response
+        except torch.cuda.OutOfMemoryError:
+            # c2 + c5: Handle VRAM overflow gracefully
+            torch.cuda.empty_cache()
+            print(f"\n{Fore.RED}{Style.BRIGHT}[OOM]{Style.RESET_ALL} VRAM full — cleared cache")
+            self.speak_async("Memory is full, please try again.")
+            return None
         except Exception as e:
+            # c5: Verbal error feedback instead of silent failure
             print(f"\n{Fore.RED}[BRAIN ERROR]{Style.RESET_ALL} LLM Inference failed: {e}")
-            return "<intent>QUERY</intent><response>Sorry, I could not process that.</response><command>NONE</command>"
+            self.speak_async("Sorry, I could not process that.")
+            return None
 
     def parse_llm_output(self, raw_output):
         """Parse structured XML tags from LLM output."""
@@ -441,16 +473,23 @@ Rules:
         return intent, response, command
 
     def _clean_speech_text(self, text):
-        """Remove any command/metadata artifacts from text before speaking."""
-        # Remove XML tags like <response>, </response>, <command>, </command>
-        text = re.sub(r'</?\w+>', '', text)
-        # Remove lines with ### or command metadata
+        """Remove command/metadata artifacts from text before speaking (c3: less aggressive)."""
+        text = re.sub(r'<[^>]+>', '', text)  # strip XML tags
         lines = text.split('\n')
-        clean_lines = [l.strip() for l in lines if not l.strip().startswith('###') and 'Motor Command' not in l and 'FORWARD' not in l.upper().split() and 'BACKWARD' not in l.upper().split()]
-        text = ' '.join(clean_lines).strip()
-        # Remove extra whitespace
-        text = re.sub(r'\s+', ' ', text)
-        return text
+        clean = []
+        for line in lines:
+            s = line.strip()
+            if not s:
+                continue
+            if s.startswith('###'):
+                continue
+            if re.match(r'^(Motor Command|Command)\s*:', s, re.I):
+                continue
+            # c3: Only remove lines that are SOLELY a command keyword
+            if re.match(r'^(FORWARD|BACKWARD|LEFT|RIGHT|STOP|NONE)$', s, re.I):
+                continue
+            clean.append(s)
+        return re.sub(r'\s+', ' ', ' '.join(clean)).strip()
 
     def speak_async(self, text):
         clean_text = self._clean_speech_text(text)
@@ -460,18 +499,14 @@ Rules:
         def _speak():
             try:
                 print(f"{Fore.BLUE}{Style.BRIGHT}[\U0001f50a SPEAKING]{Style.RESET_ALL} {clean_text}")
-                voice = PiperVoice.load(
-                    JARVIS_VOICE_MODEL,
-                    config_path=JARVIS_VOICE_CONFIG
-                )
-                # Collect raw audio from synthesize() iterator
+                # c1: Use pre-loaded TTS voice instead of reloading every call
                 audio_bytes = b''
-                for audio_chunk in voice.synthesize(clean_text):
+                for audio_chunk in self.tts_voice.synthesize(clean_text):
                     audio_bytes += audio_chunk.audio_int16_bytes
                 
                 if audio_bytes:
                     audio_data = np.frombuffer(audio_bytes, dtype=np.int16)
-                    sd.play(audio_data, samplerate=voice.config.sample_rate)
+                    sd.play(audio_data, samplerate=self.tts_voice.config.sample_rate)
                     sd.wait()
             except Exception as e:
                 print(f"[TTS ERROR] Speech failed: {e}")
@@ -482,8 +517,12 @@ Rules:
 
     def _process_brain_response(self, user_input, source="voice"):
         """Unified brain processing pipeline: LLM → parse → display → speak → log."""
-        # Brain processing
         raw_output = self.query_brain(self.visual_context, user_input)
+        
+        # c5: Handle None from query_brain (error already spoken)
+        if raw_output is None:
+            return None, None, "NONE"
+        
         intent, resp_text, cmd_text = self.parse_llm_output(raw_output)
 
         # Display
@@ -500,10 +539,10 @@ Rules:
         if resp_text and resp_text != "N/A":
             self.speak_async(resp_text)
 
-        # Log to file
-        with open("robot_history.log", "a") as f:
-            f.write(f"[{time.ctime()}] Intent: {intent} | Source: {source} | Context: {self.visual_context}\n")
-            f.write(f"  Input: {user_input}\n  Response: {resp_text} | Command: {cmd_text}\n\n")
+        # c6: Use rotating logger instead of raw file append
+        self.logger.info(
+            f"Intent: {intent} | Source: {source} | Context: {self.visual_context} | "
+            f"Input: {user_input} | Response: {resp_text} | Command: {cmd_text}")
 
         return intent, resp_text, cmd_text
 
@@ -551,6 +590,12 @@ Rules:
 
                 # LLM
                 raw_output = self.query_brain(self.visual_context, user_input)
+                
+                # c5: Handle None from query_brain
+                if raw_output is None:
+                    self.robot_state = "IDLE"
+                    continue
+                
                 intent, resp_text, cmd_text = self.parse_llm_output(raw_output)
 
                 # Queue result for main thread display
@@ -601,10 +646,10 @@ Rules:
                 if resp_text and resp_text != "N/A":
                     self.speak_async(resp_text)
 
-                # Log
-                with open("robot_history.log", "a") as f:
-                    f.write(f"[{time.ctime()}] Intent: {intent} | Source: {source} | Context: {self.visual_context}\n")
-                    f.write(f"  Input: {user_input}\n  Response: {resp_text} | Command: {cmd_text}\n\n")
+                # c6: Use rotating logger
+                self.logger.info(
+                    f"Intent: {intent} | Source: {source} | Context: {self.visual_context} | "
+                    f"Input: {user_input} | Response: {resp_text} | Command: {cmd_text}")
 
                 # Return to IDLE after a short delay (let TTS start)
                 threading.Timer(1.0, self._set_idle).start()
