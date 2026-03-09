@@ -4,8 +4,6 @@ import numpy as np
 import threading
 import queue
 import time
-import wave
-import io
 import re
 import logging
 from logging.handlers import RotatingFileHandler
@@ -17,39 +15,47 @@ from ultralytics import YOLO
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
-    AutoModelForSpeechSeq2Seq, # Add these for Whisper
-    AutoProcessor
+    AutoModelForSpeechSeq2Seq,
+    AutoProcessor,
+    BitsAndBytesConfig,
 )
-from peft import PeftModel
 import sounddevice as sd
 from piper.voice import PiperVoice
-from colorama import Fore, Back, Style, init
+from colorama import Fore, Style, init
 
-# Initialize colorama
 init(autoreset=True)
-# import scipy.io.wavfile as wav # Removed as no longer needed
 
 # --- CONFIGURATION ---
-VISION_MODEL_PATH = "robot-assistant/models/yolo11n.pt"
-WHISPER_MODEL_PATH = "robot-assistant/models/whisper-finetuned-best"
-LLM_BASE_MODEL = "unsloth/Llama-3.2-3B-Instruct-bnb-4bit"
-LLM_ADAPTER_PATH = "robot-assistant/models/llm-finetuned-adapter"
-JARVIS_VOICE_MODEL = "robot-assistant/voices/jarvis/en/en_GB/jarvis/high/jarvis-high.onnx"
-JARVIS_VOICE_CONFIG = "robot-assistant/voices/jarvis/en/en_GB/jarvis/high/jarvis-high.onnx.json"
-HAND_LANDMARKER_PATH = "robot-assistant/models/hand_landmarker.task"
-YOLO_CONF_THRESHOLD = 0.45  # c4: raised from 0.15 to reduce false positives
+VISION_MODEL_PATH     = "robot-assistant/models/yolo11n.pt"
+WHISPER_MODEL_PATH    = "robot-assistant/models/whisper-finetuned-best"
+# FIX 1: Use base instruction-tuned model directly — LoRA adapter removed.
+# Rationale: 100-step fine-tune on a small dataset degrades instruction-following
+# of the base model rather than improving it. The base Llama-3.2-3B-Instruct is
+# more reliably aligned with our strict XML prompt format.
+LLM_BASE_MODEL        = "unsloth/Llama-3.2-3B-Instruct-bnb-4bit"
+JARVIS_VOICE_MODEL    = "robot-assistant/voices/jarvis/en/en_GB/jarvis/high/jarvis-high.onnx"
+JARVIS_VOICE_CONFIG   = "robot-assistant/voices/jarvis/en/en_GB/jarvis/high/jarvis-high.onnx.json"
+HAND_LANDMARKER_PATH  = "robot-assistant/models/hand_landmarker.task"
+YOLO_CONF_THRESHOLD   = 0.45
 
-# MediaPipe Hand Connections for drawing (since mp.solutions.drawing_utils is removed)
+VALID_COMMANDS = {"FORWARD", "BACKWARD", "LEFT", "RIGHT", "STOP", "NONE"}
+
+# Explicit movement keywords — used by the safety gate before sending to LLM
+# Any voice input that does NOT contain these words should never produce a movement command.
+MOVEMENT_TRIGGER_WORDS = {
+    "forward", "backward", "back", "left", "right", "turn", "move",
+    "go", "stop", "halt", "reverse", "advance", "retreat",
+}
+
 HAND_CONNECTIONS = [
-    (0,1),(1,2),(2,3),(3,4),       # thumb
-    (0,5),(5,6),(6,7),(7,8),       # index
-    (0,9),(9,10),(10,11),(11,12),  # middle
-    (0,13),(13,14),(14,15),(15,16),# ring
-    (0,17),(17,18),(18,19),(19,20),# pinky
-    (5,9),(9,13),(13,17),          # palm
+    (0,1),(1,2),(2,3),(3,4),
+    (0,5),(5,6),(6,7),(7,8),
+    (0,9),(9,10),(10,11),(11,12),
+    (0,13),(13,14),(14,15),(15,16),
+    (0,17),(17,18),(18,19),(19,20),
+    (5,9),(9,13),(13,17),
 ]
 
-# Gesture-to-command mapping (deterministic, bypass LLM)
 GESTURE_COMMAND_MAP = {
     "pointing":    "FORWARD",
     "open_palm":   "STOP",
@@ -66,8 +72,13 @@ GESTURE_RESPONSE_MAP = {
     "thumb_right": "Turning right.",
 }
 
+
+# ---------------------------------------------------------------------------
+# GestureDetector
+# ---------------------------------------------------------------------------
 class GestureDetector:
-    """Background gesture detector using MediaPipe HandLandmarker (tasks API)."""
+    """Deterministic gesture → command mapping via MediaPipe HandLandmarker."""
+
     GESTURE_MAP = {
         "open_palm":   "STOP",
         "pointing":    "FORWARD",
@@ -96,48 +107,34 @@ class GestureDetector:
         self._frame_ts = 0
 
     def _classify_gesture(self, landmarks):
-        """Classify hand gesture from NormalizedLandmark list."""
         tip_ids = [4, 8, 12, 16, 20]
         pip_ids = [3, 6, 10, 14, 18]
 
-        # Thumb: distance-based (more stable than x comparison)
-        wrist = landmarks[0]
+        wrist     = landmarks[0]
         thumb_tip = landmarks[4]
         thumb_pip = landmarks[3]
-        thumb_dist_tip = abs(thumb_tip.x - wrist.x)
-        thumb_dist_pip = abs(thumb_pip.x - wrist.x)
-        thumb_up = thumb_dist_tip > thumb_dist_pip
+        thumb_up  = abs(thumb_tip.x - wrist.x) > abs(thumb_pip.x - wrist.x)
 
-        # Other fingers: tip.y < pip.y = extended
         index_up  = landmarks[tip_ids[1]].y < landmarks[pip_ids[1]].y
         middle_up = landmarks[tip_ids[2]].y < landmarks[pip_ids[2]].y
         ring_up   = landmarks[tip_ids[3]].y < landmarks[pip_ids[3]].y
         pinky_up  = landmarks[tip_ids[4]].y < landmarks[pip_ids[4]].y
 
-        # Open palm: all 4 fingers up → STOP
         if index_up and middle_up and ring_up and pinky_up:
             return "open_palm"
-
-        # Pointing: only index finger up → FORWARD
         if index_up and not middle_up and not ring_up and not pinky_up:
             return "pointing"
-
-        # Fist: all fingers closed, thumb not extended → BACKWARD
         if not index_up and not middle_up and not ring_up and not pinky_up and not thumb_up:
             return "fist"
-
-        # Thumb only extended → check direction for LEFT/RIGHT/thumbs_up
         if thumb_up and not index_up and not middle_up and not ring_up and not pinky_up:
             if thumb_tip.x < wrist.x - 0.12:
                 return "thumb_left"
             elif thumb_tip.x > wrist.x + 0.12:
                 return "thumb_right"
             return "thumbs_up"
-
         return "none"
 
     def _draw_landmarks(self, frame, landmarks, h, w):
-        """Draw hand landmarks and connections on the frame."""
         pts = [(int(lm.x * w), int(lm.y * h)) for lm in landmarks]
         for start, end in HAND_CONNECTIONS:
             cv2.line(frame, pts[start], pts[end], (0, 255, 200), 2)
@@ -145,13 +142,11 @@ class GestureDetector:
             cv2.circle(frame, pt, 4, (0, 200, 255), -1)
 
     def process_frame(self, frame):
-        """Process a frame for gesture detection. Call from main loop."""
         h, w = frame.shape[:2]
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        rgb      = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-
-        self._frame_ts += 33  # ~30fps in ms
-        result = self.landmarker.detect_for_video(mp_image, self._frame_ts)
+        self._frame_ts += 33
+        result   = self.landmarker.detect_for_video(mp_image, self._frame_ts)
 
         gesture = "none"
         if result.hand_landmarks:
@@ -164,149 +159,163 @@ class GestureDetector:
         return gesture
 
     def get_gesture(self):
-        """Thread-safe getter for current gesture."""
         with self._lock:
             return self.current_gesture
 
     def get_command(self):
-        """Map current gesture to motor command."""
         return self.GESTURE_MAP.get(self.get_gesture(), "NONE")
 
     def close(self):
-        """Explicitly close MediaPipe landmarker to prevent TypeError on exit."""
         try:
             self.landmarker.close()
         except Exception:
             pass
 
 
+# ---------------------------------------------------------------------------
+# WakeWordListener
+# ---------------------------------------------------------------------------
 class WakeWordListener:
-    """Background wake word detector using openwakeword."""
     def __init__(self, sensitivity=0.5):
         self.oww = WakeWordModel(
             wakeword_models=["hey_jarvis"],
             inference_framework="onnx"
         )
-        self.sensitivity = sensitivity
-        self._activated = threading.Event()
-        self._running = False
-        self._thread = None
+        self.sensitivity  = sensitivity
+        self._activated   = threading.Event()
+        self._running     = False
+        self._thread      = None
 
     def start(self):
-        """Start listening for wake word in background thread."""
         self._running = True
-        self._thread = threading.Thread(target=self._listen_loop, daemon=True)
+        self._thread  = threading.Thread(target=self._listen_loop, daemon=True)
         self._thread.start()
 
     def stop(self):
         self._running = False
 
     def _listen_loop(self):
-        """Continuously listen for wake word."""
-        pa = pyaudio.PyAudio()
-        mic = pa.open(
-            rate=16000, channels=1,
-            format=pyaudio.paInt16,
-            input=True, frames_per_buffer=1280
-        )
-
+        pa  = pyaudio.PyAudio()
+        mic = pa.open(rate=16000, channels=1, format=pyaudio.paInt16,
+                      input=True, frames_per_buffer=1280)
         while self._running:
             chunk = np.frombuffer(mic.read(1280, exception_on_overflow=False), dtype=np.int16)
             preds = self.oww.predict(chunk)
             for model_name, score in preds.items():
                 if score > self.sensitivity:
-                    print(f"\n{Fore.GREEN}{Style.BRIGHT}[WAKE]{Style.RESET_ALL} '{model_name}' detected! (score: {score:.2f})")
+                    print(f"\n{Fore.GREEN}{Style.BRIGHT}[WAKE]{Style.RESET_ALL} "
+                          f"'{model_name}' detected! (score: {score:.2f})")
                     self._activated.set()
-                    self.oww.reset()  # prevent rapid re-trigger
+                    self.oww.reset()
                     time.sleep(0.3)
-
         mic.stop_stream()
         mic.close()
         pa.terminate()
 
     def check_activated(self):
-        """Check if wake word was detected (non-blocking). Clears the flag."""
         if self._activated.is_set():
             self._activated.clear()
             return True
         return False
 
 
+# ---------------------------------------------------------------------------
+# EchoRobot
+# ---------------------------------------------------------------------------
 class EchoRobot:
     def __init__(self):
         print("Initializing Echo Robot Systems...")
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        
-        # 1. Load Vision (YOLO)
+
+        # FIX 2: Thread-safe context access.
+        # visual_context is written by the main thread (YOLO) and read by the
+        # audio worker thread (LLM). Without a lock, reads can observe a partial
+        # list reassignment under CPython's GIL semantics.
+        self._context_lock  = threading.Lock()
+        self._visual_context = []  # always access via the property below
+
+        # 1. Vision
         print("Loading Vision Module (YOLO)...")
         self.vision_model = YOLO(VISION_MODEL_PATH)
-        self.visual_context = []
-        
-        # 2. Load STT (Whisper)
+
+        # 2. STT
         print("Loading Audio Module (Whisper)...")
         self.stt_model = AutoModelForSpeechSeq2Seq.from_pretrained(
             WHISPER_MODEL_PATH,
-            dtype=torch.float16, # Use half for speed
+            dtype=torch.float16,
             low_cpu_mem_usage=True,
-            use_safetensors=True
+            use_safetensors=True,
         ).to(self.device)
         self.stt_processor = AutoProcessor.from_pretrained(WHISPER_MODEL_PATH)
-        
-        # 3. Load Brain (Llama 3.2 3B + LoRA)
-        print("Loading Brain Module (Llama 3.2 3B LoRA)...")
-        base_model = AutoModelForCausalLM.from_pretrained(
+
+        # 3. LLM — base model only, no LoRA adapter
+        print("Loading Brain Module (Llama 3.2 3B — base, no LoRA)...")
+        self.llm_model = AutoModelForCausalLM.from_pretrained(
             LLM_BASE_MODEL,
-            device_map="auto"
-            # quantization_config not needed — unsloth model bundles its own config
+            device_map="auto",
         )
-        self.llm_model = PeftModel.from_pretrained(base_model, LLM_ADAPTER_PATH)
+        self.llm_model.eval()
         self.llm_tokenizer = AutoTokenizer.from_pretrained(LLM_BASE_MODEL)
         self.llm_tokenizer.pad_token = self.llm_tokenizer.eos_token
-        
-        # 4. Load Gesture Detector (MediaPipe)
+
+        # 4. Gesture
         print("Loading Gesture Module (MediaPipe)...")
         self.gesture_detector = GestureDetector()
-        
-        # 5. Setup Wake Word Listener
+
+        # 5. Wake word
         print("Loading Wake Word Module (openwakeword)...")
         self.wakeword = WakeWordListener(sensitivity=0.5)
-        
-        # 6. Load TTS Voice once (c1: avoid reloading .onnx every speak call)
+
+        # 6. TTS — loaded once to avoid ONNX reload penalty per utterance
         print("Loading TTS Voice (Piper)...")
         self.tts_voice = PiperVoice.load(JARVIS_VOICE_MODEL, config_path=JARVIS_VOICE_CONFIG)
-        
-        # 7. Threading infrastructure
-        self.audio_trigger = queue.Queue()    # signals to start audio pipeline
-        self.response_queue = queue.Queue()   # results from audio pipeline
-        self.robot_state = "IDLE"             # IDLE, LISTENING, THINKING, SPEAKING
-        
-        # 8. Setup rotating logger (c6: 5MB max, 3 backups)
+
+        # 7. Threading
+        self.audio_trigger  = queue.Queue()
+        self.response_queue = queue.Queue()
+        self.robot_state    = "IDLE"
+
+        # 8. Rotating logger
         log_handler = RotatingFileHandler(
-            'robot_history.log', maxBytes=5*1024*1024, backupCount=3)
-        logging.basicConfig(
-            handlers=[log_handler], level=logging.INFO,
-            format='%(asctime)s | %(message)s')
+            'robot_history.log', maxBytes=5 * 1024 * 1024, backupCount=3)
+        logging.basicConfig(handlers=[log_handler], level=logging.INFO,
+                            format='%(asctime)s | %(message)s')
         self.logger = logging.getLogger('echo')
-        
-        # c2: VRAM monitoring after all models loaded
+
+        # VRAM report
         if torch.cuda.is_available():
-            alloc = torch.cuda.memory_allocated() / 1024**3
-            total = torch.cuda.get_device_properties(0).total_memory / 1024**3
-            pct = alloc / total * 100
+            alloc = torch.cuda.memory_allocated() / 1024 ** 3
+            total = torch.cuda.get_device_properties(0).total_memory / 1024 ** 3
+            pct   = alloc / total * 100
             color = Fore.RED if pct > 90 else Fore.YELLOW if pct > 75 else Fore.GREEN
             print(f"{color}[VRAM] {alloc:.2f}GB / {total:.2f}GB ({pct:.0f}% used){Style.RESET_ALL}")
             if pct > 90:
-                print(f"{Fore.RED}{Style.BRIGHT}[VRAM WARNING] >90% used — high OOM risk!{Style.RESET_ALL}")
-        
+                print(f"{Fore.RED}{Style.BRIGHT}[VRAM WARNING] >90% — high OOM risk!{Style.RESET_ALL}")
+
         print(f"{Fore.GREEN}{Style.BRIGHT}Robot Systems Online!{Style.RESET_ALL}")
-        print(f"  Say {Fore.CYAN}'Hey Jarvis'{Style.RESET_ALL} or press {Fore.CYAN}'s'{Style.RESET_ALL} to speak")
+        print(f"  Say {Fore.CYAN}'Hey Echo'{Style.RESET_ALL} or press {Fore.CYAN}'s'{Style.RESET_ALL} to speak")
         print(f"  Press {Fore.YELLOW}'g'{Style.RESET_ALL} for gesture, {Fore.RED}'q'{Style.RESET_ALL} to quit")
 
+    # ------------------------------------------------------------------
+    # Thread-safe visual_context property
+    # ------------------------------------------------------------------
+    @property
+    def visual_context(self):
+        with self._context_lock:
+            return list(self._visual_context)  # return a shallow copy
+
+    @visual_context.setter
+    def visual_context(self, value):
+        with self._context_lock:
+            self._visual_context = value
+
+    # ------------------------------------------------------------------
+    # Vision
+    # ------------------------------------------------------------------
     def get_visual_context(self, frame):
-        """Extract spatial-aware visual context with position, distance proxy, and confidence."""
-        h, w = frame.shape[:2]
+        h, w    = frame.shape[:2]
         results = self.vision_model(frame, conf=YOLO_CONF_THRESHOLD, verbose=False)
-        context_items = []
+        items   = []
 
         for r in results:
             for box, cls, conf in zip(r.boxes.xyxy, r.boxes.cls, r.boxes.conf):
@@ -314,71 +323,58 @@ class EchoRobot:
                 x1, y1, x2, y2 = box.tolist()
                 cx = (x1 + x2) / 2
 
-                # Horizontal position
-                if cx < w * 0.33:
-                    h_pos = "left"
-                elif cx < w * 0.66:
-                    h_pos = "center"
-                else:
-                    h_pos = "right"
+                h_pos = "left" if cx < w * 0.33 else ("center" if cx < w * 0.66 else "right")
 
-                # Distance proxy via bbox area ratio
                 area_ratio = ((x2 - x1) * (y2 - y1)) / (w * h)
-                if area_ratio > 0.3:
-                    dist = "close"
-                elif area_ratio > 0.1:
-                    dist = "nearby"
-                else:
-                    dist = "far"
+                dist = "close" if area_ratio > 0.3 else ("nearby" if area_ratio > 0.1 else "far")
 
-                # Draw bounding box on frame — color by distance
                 color_map = {"close": (0, 0, 255), "nearby": (0, 255, 255), "far": (0, 255, 0)}
-                color = color_map.get(dist, (255, 255, 255))
+                color = color_map[dist]
                 cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
                 label = f"{name} {conf:.0%}"
                 (lw, lh), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-                cv2.rectangle(frame, (int(x1), int(y1) - lh - 6), (int(x1) + lw, int(y1)), color, -1)
+                cv2.rectangle(frame, (int(x1), int(y1) - lh - 6),
+                              (int(x1) + lw, int(y1)), color, -1)
                 cv2.putText(frame, label, (int(x1), int(y1) - 4),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
 
-                context_items.append(
-                    f"{name} ({h_pos}, {dist}, conf:{conf:.2f})"
-                )
+                items.append(f"{name} ({h_pos}, {dist}, conf:{conf:.2f})")
 
-        return context_items
-        # Output example: ["person (center, close, conf:0.91)", "laptop (left, nearby, conf:0.87)"]
+        return items
 
+    # ------------------------------------------------------------------
+    # Audio — VAD recording
+    # ------------------------------------------------------------------
     def record_with_vad(self, sample_rate=16000, silence_threshold=1.5, max_duration=8):
-        """Record audio with Voice Activity Detection — auto-stops after speech ends."""
-        vad = webrtcvad.Vad(2)  # aggressiveness 0-3 (2 = balanced)
-        chunk_duration = 0.03   # 30ms chunks (required by webrtcvad)
-        chunk_size = int(sample_rate * chunk_duration)
-
-        frames = []
+        vad            = webrtcvad.Vad(2)
+        chunk_duration = 0.03
+        chunk_size     = int(sample_rate * chunk_duration)
+        frames         = []
         silence_chunks = 0
-        max_silence = int(silence_threshold / chunk_duration)
-        max_chunks = int(max_duration / chunk_duration)
-        speaking = False
+        max_silence    = int(silence_threshold / chunk_duration)
+        max_chunks     = int(max_duration / chunk_duration)
+        speaking       = False
 
-        print(f"\n{Fore.CYAN}[LISTENING]{Style.RESET_ALL} Speak now... (auto-stops after {silence_threshold}s silence, max {max_duration}s)")
+        print(f"\n{Fore.CYAN}[LISTENING]{Style.RESET_ALL} Speak now... "
+              f"(auto-stops after {silence_threshold}s silence, max {max_duration}s)")
 
         try:
             with sd.InputStream(samplerate=sample_rate, channels=1, dtype='int16') as stream:
                 while len(frames) < max_chunks:
-                    chunk, _ = stream.read(chunk_size)
+                    chunk, _    = stream.read(chunk_size)
                     chunk_bytes = chunk.tobytes()
-
-                    is_speech = vad.is_speech(chunk_bytes, sample_rate)
+                    is_speech   = vad.is_speech(chunk_bytes, sample_rate)
 
                     if is_speech:
-                        speaking = True
+                        speaking       = True
                         silence_chunks = 0
                         frames.append(chunk)
                     elif speaking:
                         silence_chunks += 1
-                        frames.append(chunk)  # keep trailing silence for natural cutoff
+                        frames.append(chunk)
                         if silence_chunks > max_silence:
-                            print(f"{Fore.GREEN}[VAD]{Style.RESET_ALL} Speech ended ({len(frames) * chunk_duration:.1f}s captured)")
+                            print(f"{Fore.GREEN}[VAD]{Style.RESET_ALL} "
+                                  f"Speech ended ({len(frames) * chunk_duration:.1f}s captured)")
                             break
         except Exception as e:
             print(f"{Fore.RED}[VAD ERROR]{Style.RESET_ALL} Recording failed: {e}")
@@ -388,159 +384,199 @@ class EchoRobot:
             print(f"{Fore.YELLOW}[VAD]{Style.RESET_ALL} No speech detected.")
             return np.array([], dtype=np.float32)
 
-        audio = np.concatenate(frames).flatten().astype(np.float32)
-        audio = audio / 32768.0  # normalize int16 → float32
+        audio  = np.concatenate(frames).flatten().astype(np.float32)
+        audio /= 32768.0
         return audio
 
-    def record_audio(self):
-        """Record via VAD, then transcribe with Whisper."""
-        try:
-            audio_data = self.record_with_vad()
+    # ------------------------------------------------------------------
+    # LLM — safety gate + inference
+    # ------------------------------------------------------------------
+    def _contains_movement_intent(self, transcript: str) -> bool:
+        """
+        Pre-LLM safety gate: returns True only if the transcript contains an
+        explicit movement keyword. This prevents ambiguous inputs (e.g. 'move
+        to court', 'go away from here') from being sent to the LLM with the
+        expectation of a movement command.
 
-            if audio_data.size == 0:
-                return ""
-
-            print("[AUDIO CAPTURED] Transcribing...")
-
-            # Preprocess the audio
-            input_features = self.stt_processor(
-                audio_data,
-                sampling_rate=16000,
-                return_tensors="pt"
-            ).input_features.to(self.device).to(torch.float16)
-
-            # Generate transcription
-            predicted_ids = self.stt_model.generate(
-                input_features,
-                language="en",
-                task="transcribe"
-            )
-
-            # Decode the ids
-            transcription = self.stt_processor.batch_decode(
-                predicted_ids,
-                skip_special_tokens=True
-            )[0]
-
-            return transcription.strip()
-        except Exception as e:
-            print(f"\n{Fore.RED}[AUDIO ERROR]{Style.RESET_ALL} Failed to record/transcribe: {e}")
-            import traceback
-            traceback.print_exc()
-            return ""
+        If False, the LLM prompt is still used, but parse_llm_output() will
+        enforce NONE as the command — this gate is an additional audit layer.
+        """
+        words = set(re.findall(r'\b\w+\b', transcript.lower()))
+        return bool(words & MOVEMENT_TRIGGER_WORDS)
 
     def query_brain(self, visual_context, user_input):
-        """Send visual context + user input (voice and/or gesture) to LLM with unified intent system."""
         try:
             print("[BRAIN] Analyzing visual context and query...")
-            
-            instruction = """You are Echo, a friendly robot assistant with a camera.
-Always respond using this exact XML format:
 
-<response>Your spoken response here. Natural, 1-2 sentences max.</response>
-<command>FORWARD|BACKWARD|LEFT|RIGHT|STOP|NONE</command>
+            has_movement_intent = self._contains_movement_intent(user_input)
+            movement_note = (
+                "The user input contains explicit movement keywords. A movement command MAY be appropriate."
+                if has_movement_intent else
+                "The user input contains NO movement keywords. The <command> MUST be NONE."
+            )
 
-Rules:
-- <response> is what you SAY OUT LOUD. Keep it conversational.
-- <command> is the motor action. Use NONE if no movement needed.
-- NEVER put command keywords inside <response>.
-- NEVER output any text outside the XML tags.
-- Always respond in English.
+            # Format visual context as an explicit numbered list with count.
+            # Giving the model the count directly prevents it from miscounting,
+            # and the strict "only these objects" instruction reduces hallucination.
+            if visual_context:
+                obj_lines = "\n".join(f"  {i+1}. {obj}" for i, obj in enumerate(visual_context))
+                context_block = (
+                    f"Detected objects ({len(visual_context)} total):\n{obj_lines}\n\n"
+                    f"STRICT RULE: Your response MUST only reference the {len(visual_context)} "
+                    f"object(s) listed above. Never mention any object not in this list."
+                )
+            else:
+                context_block = (
+                    "Detected objects: none\n\n"
+                    "STRICT RULE: You cannot see anything. Tell the user there are no objects visible."
+                )
 
-Example:
-Visual: person (center, close), laptop (left, nearby)
-User: What do you see?
-<response>I can see a person right in front of me and a laptop to my left.</response>
-<command>NONE</command>"""
-            input_text = f"Visual Context: {visual_context}\nUser Input: {user_input}"
-            prompt = f"### Instruction: {instruction}\n### Input: {input_text}\n### Response: "
-            
+            # Use ChatML format — correct for Llama-3.2-3B-Instruct (unsloth variant).
+            # The previous Alpaca ### Instruction / ### Response format caused the model
+            # to reproduce prompt template text verbatim as its output.
+            system_prompt = (
+                "You are Echo, a robot assistant with a camera and motor control. "
+                "You MUST reply using ONLY this exact XML format — no text outside the tags:\n\n"
+                "<response>A natural, complete spoken sentence based only on detected objects.</response>\n"
+                "<command>FORWARD|BACKWARD|LEFT|RIGHT|STOP|NONE</command>\n\n"
+                "COMMAND RULES:\n"
+                "- FORWARD  : 'move forward', 'go forward', 'advance'\n"
+                "- BACKWARD : 'go back', 'reverse', 'retreat'\n"
+                "- LEFT     : 'turn left', 'go left'\n"
+                "- RIGHT    : 'turn right', 'go right'\n"
+                "- STOP     : 'stop', 'halt'\n"
+                "- NONE     : questions, greetings, descriptions, anything ambiguous\n\n"
+                f"MOVEMENT GUIDANCE: {movement_note}"
+            )
+
+            user_message = (
+                f"{context_block}\n\n"
+                f"User said: {user_input}\n\n"
+                "Reply in the required XML format."
+            )
+
+            # Apply the model's built-in chat template so special tokens are
+            # handled correctly (e.g. <|im_start|>, <|im_end|>, <|eot_id|>).
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": user_message},
+            ]
+            prompt = self.llm_tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+
             inputs = self.llm_tokenizer(prompt, return_tensors="pt").to(self.device)
-            
+
             with torch.no_grad():
                 outputs = self.llm_model.generate(
                     **inputs,
-                    max_new_tokens=150,
+                    max_new_tokens=120,
+                    max_length=None,       # suppress the max_length config warning
                     do_sample=True,
-                    temperature=0.3,
+                    temperature=0.1,       # lower = more deterministic, less hallucination
                     top_p=0.9,
                     pad_token_id=self.llm_tokenizer.eos_token_id,
-                    eos_token_id=self.llm_tokenizer.eos_token_id
+                    eos_token_id=self.llm_tokenizer.eos_token_id,
                 )
-                
-            full_response = self.llm_tokenizer.decode(outputs[0], skip_special_tokens=True)
-            
-            # Extract only the newly generated part after ### Response:
-            if "### Response: " in full_response:
-                response = full_response.split("### Response: ")[-1].strip()
-            else:
-                response = full_response.strip()
-                
-            return response
+
+            # Decode only the newly generated tokens (strip the prompt).
+            input_len     = inputs["input_ids"].shape[1]
+            new_tokens    = outputs[0][input_len:]
+            return self.llm_tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+
         except torch.cuda.OutOfMemoryError:
-            # c2 + c5: Handle VRAM overflow gracefully
             torch.cuda.empty_cache()
             print(f"\n{Fore.RED}{Style.BRIGHT}[OOM]{Style.RESET_ALL} VRAM full — cleared cache")
             self.speak_async("Memory is full, please try again.")
             return None
         except Exception as e:
-            # c5: Verbal error feedback instead of silent failure
-            print(f"\n{Fore.RED}[BRAIN ERROR]{Style.RESET_ALL} LLM Inference failed: {e}")
+            print(f"\n{Fore.RED}[BRAIN ERROR]{Style.RESET_ALL} LLM inference failed: {e}")
             self.speak_async("Sorry, I could not process that.")
             return None
 
-    def parse_llm_output(self, raw_output):
-        """Parse structured XML tags from LLM output."""
+    # ------------------------------------------------------------------
+    # FIX 3: Stricter parse_llm_output — NONE is the safe default
+    # ------------------------------------------------------------------
+    def parse_llm_output(self, raw_output: str, transcript: str = ""):
+        """
+        Parse XML tags from LLM output.
+
+        Safety contract (two layers):
+        1. Structural: if <command> tag is missing, malformed, or unrecognised → NONE.
+        2. Semantic:   if the original transcript contains no movement keyword,
+                       hard-override any movement command to NONE — regardless of
+                       what the LLM decided. This prevents spatial context leakage
+                       where the LLM maps positional words (left/right in visual
+                       context) onto the command field for non-movement queries.
+
+        The second layer is the critical addition: it makes the safety guarantee
+        independent of LLM compliance, which cannot be relied upon at 3B scale.
+        """
         def extract_tag(text, tag):
-            match = re.search(f'<{tag}>(.*?)</{tag}>', text, re.DOTALL)
+            match = re.search(f'<{tag}>(.*?)</{tag}>', text, re.DOTALL | re.IGNORECASE)
             return match.group(1).strip() if match else None
 
-        intent = extract_tag(raw_output, "intent") or "QUERY"
-        response = extract_tag(raw_output, "response") or raw_output
-        command = extract_tag(raw_output, "command") or "NONE"
-        
-        # Validate command
-        valid_commands = {"FORWARD", "BACKWARD", "LEFT", "RIGHT", "STOP", "NONE"}
-        if command.upper() not in valid_commands:
-            command = "NONE"
-        else:
-            command = command.upper()
-            
-        return intent, response, command
+        response_text = extract_tag(raw_output, "response") or raw_output
+        raw_command   = extract_tag(raw_output, "command") or ""
 
+        # Layer 1 — validate command is a known value
+        command = raw_command.strip().upper()
+        if command not in VALID_COMMANDS:
+            if command:
+                print(f"{Fore.YELLOW}[PARSE WARN]{Style.RESET_ALL} "
+                      f"Unexpected command '{command}' → defaulting to NONE")
+            command = "NONE"
+
+        # Layer 2 — hard override: non-movement input MUST produce NONE command.
+        # The LLM prompt hint alone is insufficient because small models leak
+        # spatial vocabulary from visual context (e.g. "left" in context → LEFT).
+        if command != "NONE" and not self._contains_movement_intent(transcript):
+            print(f"{Fore.YELLOW}[SAFETY GATE]{Style.RESET_ALL} "
+                  f"Command '{command}' blocked — no movement keyword in transcript.")
+            command = "NONE"
+
+        intent = "QUERY"
+        return intent, response_text, command
+
+    # ------------------------------------------------------------------
+    # TTS
+    # ------------------------------------------------------------------
     def _clean_speech_text(self, text):
-        """Extract clean speech text from LLM output, stripping XML and command artifacts."""
-        # Priority: extract content from <response> tag if present
         match = re.search(r'<response>(.*?)</response>', text, re.DOTALL)
         if match:
             return match.group(1).strip()
-        # Fallback: strip command tags and their content
+
         text = re.sub(r'<command>.*?</command>', '', text, flags=re.DOTALL)
-        # Strip remaining XML tags
         text = re.sub(r'<[^>]+>', '', text)
-        # Remove lines that are solely a command keyword
-        lines = text.split('\n')
-        clean = [l.strip() for l in lines
-                 if l.strip()
-                 and not re.match(
-                     r'^(FORWARD|BACKWARD|LEFT|RIGHT|STOP|NONE)$',
-                     l.strip(), re.I
-                 )]
-        return re.sub(r'\s+', ' ', ' '.join(clean)).strip()
+
+        lines = []
+        for line in text.split('\n'):
+            s = line.strip()
+            if not s or s.startswith('###'):
+                continue
+            if re.match(r'^(Motor Command|Command|Intent)\s*:', s, re.I):
+                continue
+            if re.match(r'^(FORWARD|BACKWARD|LEFT|RIGHT|STOP|NONE|QUERY|COMMAND|GESTURE_COMMAND)$',
+                        s, re.I):
+                continue
+            lines.append(s)
+
+        result = re.sub(r'\s+', ' ', ' '.join(lines)).strip()
+        return "" if re.match(r'^\d+$', result) else result
 
     def speak_async(self, text):
         clean_text = self._clean_speech_text(text)
         if not clean_text:
             return
-            
+
         def _speak():
             try:
-                print(f"{Fore.BLUE}{Style.BRIGHT}[\U0001f50a SPEAKING]{Style.RESET_ALL} {clean_text}")
-                # c1: Use pre-loaded TTS voice instead of reloading every call
+                print(f"{Fore.BLUE}{Style.BRIGHT}[🔊 SPEAKING]{Style.RESET_ALL} {clean_text}")
                 audio_bytes = b''
-                for audio_chunk in self.tts_voice.synthesize(clean_text):
-                    audio_bytes += audio_chunk.audio_int16_bytes
-                
+                for chunk in self.tts_voice.synthesize(clean_text):
+                    audio_bytes += chunk.audio_int16_bytes
                 if audio_bytes:
                     audio_data = np.frombuffer(audio_bytes, dtype=np.int16)
                     sd.play(audio_data, samplerate=self.tts_voice.config.sample_rate)
@@ -550,69 +586,39 @@ User: What do you see?
 
         threading.Thread(target=_speak, daemon=True).start()
 
+    # ------------------------------------------------------------------
+    # Gesture — deterministic, bypasses LLM entirely
+    # ------------------------------------------------------------------
     def handle_gesture_command(self, gesture):
-        """Gesture command — bypass LLM completely. Deterministic, <1ms."""
-        command = GESTURE_COMMAND_MAP.get(gesture)
+        command  = GESTURE_COMMAND_MAP.get(gesture)
         response = GESTURE_RESPONSE_MAP.get(gesture, "Gesture not recognized.")
-
         if command:
             self.send_motor_command(command)
             self.speak_async(response)
             print(f"\n{Fore.YELLOW}{'='*50}")
-            print(f"{Fore.YELLOW}{Style.BRIGHT}[GESTURE]{Style.RESET_ALL} {gesture} \u2192 {Fore.RED}{command}")
+            print(f"{Fore.YELLOW}{Style.BRIGHT}[GESTURE]{Style.RESET_ALL} "
+                  f"{gesture} → {Fore.RED}{command}")
             print(f"{Fore.YELLOW}{'='*50}\n")
-            # Log gesture command
             self.logger.info(
-                f"Intent: GESTURE_COMMAND | Source: gesture | Context: {self.visual_context} | "
-                f"Input: gesture:{gesture} | Response: {response} | Command: {command}")
+                f"Intent: GESTURE_COMMAND | Source: gesture | "
+                f"Context: {self.visual_context} | Input: gesture:{gesture} | "
+                f"Response: {response} | Command: {command}")
         else:
-            print(f"{Fore.YELLOW}[GESTURE]{Style.RESET_ALL} '{gesture}' \u2014 no mapping found.")
+            print(f"{Fore.YELLOW}[GESTURE]{Style.RESET_ALL} '{gesture}' — no mapping found.")
 
     def send_motor_command(self, command):
-        """Placeholder for laptop testing. Replace body when integrating ESP32."""
-        # TODO: self.serial.write(f"MOTOR:{command}\n".encode()) when ESP32 connected
-        print(f"{Fore.MAGENTA}[MOTOR]{Style.RESET_ALL} >> {command} (simulated \u2014 ESP32 not connected)")
+        print(f"{Fore.MAGENTA}[MOTOR]{Style.RESET_ALL} >> {command} (simulated — ESP32 not connected)")
 
-    def _process_brain_response(self, user_input, source="voice"):
-        """Unified brain processing pipeline: LLM → parse → display → speak → log."""
-        raw_output = self.query_brain(self.visual_context, user_input)
-        
-        # c5: Handle None from query_brain (error already spoken)
-        if raw_output is None:
-            return None, None, "NONE"
-        
-        intent, resp_text, cmd_text = self.parse_llm_output(raw_output)
-
-        # Display
-        intent_colors = {"QUERY": Fore.CYAN, "COMMAND": Fore.MAGENTA, "GESTURE_COMMAND": Fore.YELLOW}
-        intent_color = intent_colors.get(intent, Fore.WHITE)
-
-        print(f"\n{Fore.YELLOW}{'='*50}")
-        print(f"{intent_color}{Style.BRIGHT}[{intent}]{Style.RESET_ALL} via {source}")
-        print(f"{Fore.GREEN}{Style.BRIGHT}RESPONSE:{Style.RESET_ALL} {resp_text}")
-        print(f"{Fore.MAGENTA}{Style.BRIGHT}COMMAND:{Style.RESET_ALL} {Fore.RED}{cmd_text}")
-        print(f"{Fore.YELLOW}{'='*50}\n")
-
-        # Speak the response
-        if resp_text and resp_text != "N/A":
-            self.speak_async(resp_text)
-
-        # c6: Use rotating logger instead of raw file append
-        self.logger.info(
-            f"Intent: {intent} | Source: {source} | Context: {self.visual_context} | "
-            f"Input: {user_input} | Response: {resp_text} | Command: {cmd_text}")
-
-        return intent, resp_text, cmd_text
-
+    # ------------------------------------------------------------------
+    # Audio pipeline worker thread
+    # ------------------------------------------------------------------
     def _audio_pipeline_worker(self):
-        """Worker thread: wake word / manual trigger → VAD → STT → LLM → queue response."""
         while True:
-            trigger_source = self.audio_trigger.get()  # blocks until trigger
+            trigger_source = self.audio_trigger.get()
             if trigger_source is None:
-                break  # shutdown signal
+                break
 
             try:
-                # Record with VAD
                 self.robot_state = "LISTENING"
                 audio_data = self.record_with_vad()
 
@@ -620,15 +626,21 @@ User: What do you see?
                     self.robot_state = "IDLE"
                     continue
 
-                # Transcribe
                 self.robot_state = "THINKING"
                 print("[AUDIO CAPTURED] Transcribing...")
+
                 input_features = self.stt_processor(
                     audio_data, sampling_rate=16000, return_tensors="pt"
                 ).input_features.to(self.device).to(torch.float16)
 
                 predicted_ids = self.stt_model.generate(
-                    input_features, language="en", task="transcribe"
+                    input_features,
+                    attention_mask=torch.ones(input_features.shape[:2],
+                                             dtype=torch.long, device=self.device),
+                    language="en",
+                    task="transcribe",
+                    suppress_tokens=[],
+                    forced_decoder_ids=None,
                 )
                 transcript = self.stt_processor.batch_decode(
                     predicted_ids, skip_special_tokens=True
@@ -640,58 +652,54 @@ User: What do you see?
 
                 print(f"\n{Fore.CYAN}{Style.BRIGHT}USER ({trigger_source}):{Style.RESET_ALL} {transcript}")
 
-                # Combine with gesture
                 current_gesture = self.gesture_detector.get_gesture()
-                user_input = f"voice: {transcript}"
+                user_input      = f"voice: {transcript}"
                 if current_gesture != "none":
                     user_input += f" | gesture: {current_gesture}"
 
-                # LLM
-                raw_output = self.query_brain(self.visual_context, user_input)
-                
-                # c5: Handle None from query_brain
+                # FIX 2: Read visual_context via the thread-safe property (returns a copy).
+                context_snapshot = self.visual_context
+
+                raw_output = self.query_brain(context_snapshot, user_input)
                 if raw_output is None:
                     self.robot_state = "IDLE"
                     continue
-                
-                intent, resp_text, cmd_text = self.parse_llm_output(raw_output)
 
-                # Queue result for main thread display
+                intent, resp_text, cmd_text = self.parse_llm_output(raw_output, transcript)
                 self.response_queue.put((intent, resp_text, cmd_text, user_input, trigger_source))
 
             except Exception as e:
                 print(f"{Fore.RED}[PIPELINE ERROR]{Style.RESET_ALL} {e}")
                 self.robot_state = "IDLE"
 
+    # ------------------------------------------------------------------
+    # Main loop
+    # ------------------------------------------------------------------
     def run(self):
         cap = cv2.VideoCapture(0)
-
-        # Start background threads
         self.wakeword.start()
         audio_worker = threading.Thread(target=self._audio_pipeline_worker, daemon=True)
         audio_worker.start()
 
         while cap.isOpened():
             ret, frame = cap.read()
-            if not ret: break
+            if not ret:
+                break
 
-            # --- Continuous Vision (YOLO) — never blocks ---
+            # FIX 2: Write via the thread-safe setter.
             self.visual_context = self.get_visual_context(frame)
 
-            # --- Continuous Gesture Detection (MediaPipe) ---
             gesture = self.gesture_detector.process_frame(frame)
 
-            # --- Check wake word activation (non-blocking) ---
             if self.wakeword.check_activated() and self.robot_state == "IDLE":
                 self.audio_trigger.put("wake_word")
 
-            # --- Check response queue (non-blocking) ---
             try:
                 intent, resp_text, cmd_text, user_input, source = self.response_queue.get_nowait()
 
-                # Display
-                intent_colors = {"QUERY": Fore.CYAN, "COMMAND": Fore.MAGENTA, "GESTURE_COMMAND": Fore.YELLOW}
-                intent_color = intent_colors.get(intent, Fore.WHITE)
+                intent_colors = {"QUERY": Fore.CYAN, "COMMAND": Fore.MAGENTA,
+                                 "GESTURE_COMMAND": Fore.YELLOW}
+                intent_color  = intent_colors.get(intent, Fore.WHITE)
 
                 print(f"\n{Fore.YELLOW}{'='*50}")
                 print(f"{intent_color}{Style.BRIGHT}[{intent}]{Style.RESET_ALL} via {source}")
@@ -699,30 +707,32 @@ User: What do you see?
                 print(f"{Fore.MAGENTA}{Style.BRIGHT}COMMAND:{Style.RESET_ALL} {Fore.RED}{cmd_text}")
                 print(f"{Fore.YELLOW}{'='*50}\n")
 
-                # Speak
                 self.robot_state = "SPEAKING"
                 if resp_text and resp_text != "N/A":
                     self.speak_async(resp_text)
 
-                # c6: Use rotating logger
+                # Only execute movement commands — log everything
+                if cmd_text != "NONE":
+                    self.send_motor_command(cmd_text)
+
                 self.logger.info(
-                    f"Intent: {intent} | Source: {source} | Context: {self.visual_context} | "
+                    f"Intent: {intent} | Source: {source} | "
+                    f"Context: {self.visual_context} | "
                     f"Input: {user_input} | Response: {resp_text} | Command: {cmd_text}")
 
-                # Return to IDLE after a short delay (let TTS start)
                 threading.Timer(1.0, self._set_idle).start()
 
             except queue.Empty:
                 pass
 
-            # --- HUD ---
+            # HUD
             state_colors = {
                 "IDLE": (128, 128, 128), "LISTENING": (0, 255, 255),
-                "THINKING": (255, 165, 0), "SPEAKING": (0, 200, 255)
+                "THINKING": (255, 165, 0), "SPEAKING": (0, 200, 255),
             }
             state_color = state_colors.get(self.robot_state, (255, 255, 255))
-
-            cv2.putText(frame, f"Context: {', '.join(self.visual_context)}", (10, 30),
+            ctx_snapshot = self.visual_context  # one lock acquisition for display
+            cv2.putText(frame, f"Context: {', '.join(ctx_snapshot)}", (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
             gesture_color = (0, 255, 255) if gesture != "none" else (128, 128, 128)
             cv2.putText(frame, f"Gesture: {gesture}", (10, 55),
@@ -736,25 +746,23 @@ User: What do you see?
             if key == ord('q'):
                 break
             elif key == ord('s') and self.robot_state == "IDLE":
-                # Manual voice trigger (fallback)
                 self.audio_trigger.put("manual")
             elif key == ord('g'):
-                # Gesture trigger — bypass LLM, deterministic mapping
                 current_gesture = self.gesture_detector.get_gesture()
                 if current_gesture != "none" and self.robot_state == "IDLE":
                     self.handle_gesture_command(current_gesture)
                 else:
                     print(f"{Fore.YELLOW}[GESTURE]{Style.RESET_ALL} No gesture detected.")
 
-        # Cleanup
         self.wakeword.stop()
-        self.audio_trigger.put(None)  # shutdown worker
-        self.gesture_detector.close()  # explicit close — prevent TypeError on exit
+        self.audio_trigger.put(None)
+        self.gesture_detector.close()
         cap.release()
         cv2.destroyAllWindows()
 
     def _set_idle(self):
         self.robot_state = "IDLE"
+
 
 if __name__ == "__main__":
     robot = EchoRobot()
