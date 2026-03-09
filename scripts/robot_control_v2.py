@@ -32,18 +32,14 @@ init(autoreset=True)
 
 # --- CONFIGURATION ---
 VISION_MODEL_PATH = "robot-assistant/models/yolo11n.pt"
-# WHISPER_MODEL_PATH = "robot-assistant/models/whisper-finetuned-best"
-WHISPER_MODEL_PATH = "openai/whisper-small"
+WHISPER_MODEL_PATH = "robot-assistant/models/whisper-finetuned-best"
 LLM_BASE_MODEL = "unsloth/Llama-3.2-3B-Instruct-bnb-4bit"
 LLM_ADAPTER_PATH = "robot-assistant/models/llm-finetuned-adapter"
-# JARVIS_VOICE_MODEL = "robot-assistant/voices/jarvis/en/en_GB/jarvis/high/jarvis-high.onnx"
-# JARVIS_VOICE_CONFIG = "robot-assistant/voices/jarvis/en/en_GB/jarvis/high/jarvis-high.onnx.json"
-JARVIS_VOICE_MODEL = "robot-assistant/voices/en_US-lessac-medium.onnx"
-JARVIS_VOICE_CONFIG = "robot-assistant/voices/en_US-lessac-medium.onnx.json"
+JARVIS_VOICE_MODEL = "robot-assistant/voices/jarvis/en/en_GB/jarvis/high/jarvis-high.onnx"
+JARVIS_VOICE_CONFIG = "robot-assistant/voices/jarvis/en/en_GB/jarvis/high/jarvis-high.onnx.json"
 HAND_LANDMARKER_PATH = "robot-assistant/models/hand_landmarker.task"
 YOLO_CONF_THRESHOLD = 0.45  # c4: raised from 0.15 to reduce false positives
 
-# --
 # MediaPipe Hand Connections for drawing (since mp.solutions.drawing_utils is removed)
 HAND_CONNECTIONS = [
     (0,1),(1,2),(2,3),(3,4),       # thumb
@@ -146,29 +142,56 @@ class GestureDetector:
 
 
 class WakeWordListener:
-    """Background wake word detector (Bypassed for Codespaces)."""
+    """Background wake word detector using openwakeword."""
     def __init__(self, sensitivity=0.5):
-        print("Wake Word Module Bypassed (No Microphone in Cloud VM)")
+        self.oww = WakeWordModel(
+            wakeword_models=["hey_jarvis"],
+            inference_framework="onnx"
+        )
         self.sensitivity = sensitivity
         self._activated = threading.Event()
         self._running = False
         self._thread = None
 
     def start(self):
-        print("Audio listening disabled. Robot is deaf in this simulation.")
+        """Start listening for wake word in background thread."""
+        self._running = True
+        self._thread = threading.Thread(target=self._listen_loop, daemon=True)
+        self._thread.start()
 
     def stop(self):
-        pass
-        
-    def wait_for_wakeword(self):
-        import time
-        time.sleep(1)
-        return False
+        self._running = False
+
+    def _listen_loop(self):
+        """Continuously listen for wake word."""
+        pa = pyaudio.PyAudio()
+        mic = pa.open(
+            rate=16000, channels=1,
+            format=pyaudio.paInt16,
+            input=True, frames_per_buffer=1280
+        )
+
+        while self._running:
+            chunk = np.frombuffer(mic.read(1280, exception_on_overflow=False), dtype=np.int16)
+            preds = self.oww.predict(chunk)
+            for model_name, score in preds.items():
+                if score > self.sensitivity:
+                    print(f"\n{Fore.GREEN}{Style.BRIGHT}[WAKE]{Style.RESET_ALL} '{model_name}' detected! (score: {score:.2f})")
+                    self._activated.set()
+                    self.oww.reset()  # prevent rapid re-trigger
+                    time.sleep(0.3)
+
+        mic.stop_stream()
+        mic.close()
+        pa.terminate()
 
     def check_activated(self):
-        # Always return False in simulation since there is no microphone
-        # We rely on keyboard input ('s' or 'g') instead.
+        """Check if wake word was detected (non-blocking). Clears the flag."""
+        if self._activated.is_set():
+            self._activated.clear()
+            return True
         return False
+
 
 class EchoRobot:
     def __init__(self):
@@ -203,9 +226,7 @@ class EchoRobot:
             quantization_config=bnb_config,
             device_map="auto"
         )
-        # self.llm_model = PeftModel.from_pretrained(base_model, LLM_ADAPTER_PATH)
-        # self.llm_model = PeftModel.from_pretrained(base_model, LLM_ADAPTER_PATH)
-        self.llm_model = base_model # Bypass pemuatan LoRA adapter
+        self.llm_model = PeftModel.from_pretrained(base_model, LLM_ADAPTER_PATH)
         self.llm_tokenizer = AutoTokenizer.from_pretrained(LLM_BASE_MODEL)
         self.llm_tokenizer.pad_token = self.llm_tokenizer.eos_token
         
@@ -485,8 +506,8 @@ Rules:
                 
                 if audio_bytes:
                     audio_data = np.frombuffer(audio_bytes, dtype=np.int16)
-                    # sd.play(audio_data, samplerate=self.tts_voice.config.sample_rate)
-                    # sd.wait()
+                    sd.play(audio_data, samplerate=self.tts_voice.config.sample_rate)
+                    sd.wait()
             except Exception as e:
                 print(f"[TTS ERROR] Speech failed: {e}")
 
@@ -585,8 +606,7 @@ Rules:
                 self.robot_state = "IDLE"
 
     def run(self):
-        # cap = cv2.VideoCapture(0)
-        cap = cv2.VideoCapture('sample_video.mp4')
+        cap = cv2.VideoCapture(0)
 
         # Start background threads
         self.wakeword.start()
@@ -652,26 +672,23 @@ Rules:
             cv2.putText(frame, f"State: {self.robot_state}", (10, 80),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, state_color, 2)
 
-            # cv2.imshow('Echo Robot - Vision System', frame)
+            cv2.imshow('Echo Robot - Vision System', frame)
 
-            import sys, select
-            # Mengecek input terminal tanpa menghentikan proses video YOLO di latar belakang
-            if select.select([sys.stdin], [], [], 0.0)[0]:
-                key_char = sys.stdin.readline().strip()
-                if key_char == 'q':
-                    break
-                elif key_char == 's' and self.robot_state == "IDLE":
-                    # bypass mikrofon, langsung ketik prompt di terminal
-                    simulated_text = input(f"\n{Fore.CYAN}[MIC SIMULATOR] Ketik suara kamu: {Style.RESET_ALL}")
-                    if simulated_text:
-                        self._process_brain_response(f"voice: {simulated_text}", source="terminal")
-                elif key_char == 'g':
-                    current_gesture = self.gesture_detector.get_gesture()
-                    if current_gesture != "none" and self.robot_state == "IDLE":
-                        print(f"\n{Fore.YELLOW}{Style.BRIGHT}USER (gesture):{Style.RESET_ALL} {current_gesture}")
-                        self._process_brain_response(f"gesture: {current_gesture}", source="gesture")
-                    elif current_gesture == "none":
-                        print(f"{Fore.YELLOW}[GESTURE]{Style.RESET_ALL} No gesture detected in video.")
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
+            elif key == ord('s') and self.robot_state == "IDLE":
+                # Manual voice trigger (fallback)
+                self.audio_trigger.put("manual")
+            elif key == ord('g'):
+                # Gesture trigger
+                current_gesture = self.gesture_detector.get_gesture()
+                if current_gesture != "none" and self.robot_state == "IDLE":
+                    print(f"\n{Fore.YELLOW}{Style.BRIGHT}USER (gesture):{Style.RESET_ALL} {current_gesture}")
+                    user_input = f"gesture: {current_gesture}"
+                    self._process_brain_response(user_input, source="gesture")
+                elif current_gesture == "none":
+                    print(f"{Fore.YELLOW}[GESTURE]{Style.RESET_ALL} No gesture detected.")
 
         # Cleanup
         self.wakeword.stop()
